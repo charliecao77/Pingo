@@ -22,6 +22,8 @@ struct StudentStatus: Identifiable, Codable {
 
 // --- 2. 主界面 ---
 struct ContentView: View {
+    @Environment(\.scenePhase) var scenePhase
+    
     @AppStorage("hasCompletedSetup") var hasCompletedSetup = false
     @AppStorage("savedUserName") var userName = ""
     @AppStorage("familyEmail") var familyEmail = ""
@@ -30,6 +32,8 @@ struct ContentView: View {
     @AppStorage("adminPassword") var adminPassword = ""
     @AppStorage("studentReminderTime") var studentReminderTime = Date()
     @AppStorage("advanceNoticeMinutes") var advanceNoticeMinutes: Int = 30
+    
+    @AppStorage("parentAlertThreshold") var parentAlertThreshold: Int = 0
     
     @State private var isShowingSettings = false
     @State private var isShowingPasswordLock = false
@@ -64,8 +68,8 @@ struct ContentView: View {
         }
         .sheet(isPresented: $isShowingResetFlow) { resetSheetView }
         .sheet(isPresented: $isShowingSettings) {
-            SettingsView(name: $userName, email: $familyEmail, interval: $alertInterval, pwd: $adminPassword, reminderTime: $studentReminderTime, advanceNotice: $advanceNoticeMinutes, userRole: $userRole, baseURL: baseURL, onComplete: {
-                fetchStatus() // 保存后立即同步一次
+            SettingsView(name: $userName, email: $familyEmail, interval: $alertInterval, pwd: $adminPassword, reminderTime: $studentReminderTime, advanceNotice: $advanceNoticeMinutes, parentAlertThreshold: $parentAlertThreshold, userRole: $userRole, baseURL: baseURL, onComplete: {
+                fetchStatus()
             })
         }
         .alert("管理身份验证", isPresented: $isShowingPasswordLock) {
@@ -86,12 +90,17 @@ struct ContentView: View {
             if hasCompletedSetup { fetchStatus() }
             requestNotificationPermission()
         }
+        // 修复图 5 的 Deprecated 警告：使用符合 iOS 17+ 标准的语法
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            if newPhase == .active && hasCompletedSetup {
+                fetchStatus()
+            }
+        }
         .onReceive(timer) { input in
             self.currentTime = input
             if hasCompletedSetup {
                 updateCountdown()
                 let seconds = Int(input.timeIntervalSince1970) % 60
-                // 每10秒自动从云端拉取一次最新配置，实现静默同步
                 if seconds % 10 == 0 { fetchStatus() }
             }
         }
@@ -119,7 +128,6 @@ struct ContentView: View {
         }
     }
 
-    // --- 4. 绿色声波纹学生端 ---
     var studentSection: some View {
         VStack(spacing: 30) {
             Spacer()
@@ -194,10 +202,9 @@ struct ContentView: View {
         }
     }
 
-    // --- 5. 动态实时家长端 ---
     var parentSection: some View {
         List {
-            Section(header: Text("全家实时状态 (每秒更新)")) {
+            Section(header: Text("全家实时状态")) {
                 if students.isEmpty { Text("正在同步云端数据...").foregroundColor(.secondary) }
                 ForEach(students) { student in
                     HStack {
@@ -206,12 +213,17 @@ struct ContentView: View {
                             Text("上次报备: \(formatDate(student.lastDate))").font(.caption2).foregroundColor(.secondary)
                         }
                         Spacer()
-                        Text(getCountdownFor(student, current: currentTime))
+                        let displayTime = getCountdownFor(student, current: currentTime)
+                        Text(displayTime)
                             .font(.system(.body, design: .monospaced)).bold()
-                            .foregroundColor(getCountdownFor(student, current: currentTime).contains("⚠️") ? .red : .green)
+                            .foregroundColor(displayTime.contains("⚠️") ? .red : .green)
                     }
                     .padding(.vertical, 8)
                 }
+            }
+            
+            Section(header: Text("家长提醒配置")) {
+                Text("超时 \(parentAlertThreshold) 分钟后提醒我").font(.caption).foregroundColor(.secondary)
             }
             
             Section {
@@ -223,7 +235,6 @@ struct ContentView: View {
         .listStyle(.insetGrouped)
     }
 
-    // --- 6. 核心逻辑 (修复同步与通知调度) ---
     func fetchStatus() {
         guard !familyEmail.isEmpty else { return }
         var components = URLComponents(string: "\(baseURL)/status")!
@@ -243,27 +254,19 @@ struct ContentView: View {
             
             DispatchQueue.main.async {
                 self.students = decoded
-                // 查找当前用户的配置
-                if let me = decoded.first(where: { $0.name == userName }) {
-                    self.lastCheckinDate = me.lastDate
-                    if let inv = me.config.interval, let invInt = Int(inv) {
-                        if self.alertInterval != invInt {
+                
+                if userRole == "student" {
+                    if let me = decoded.first(where: { $0.name == userName }) {
+                        self.lastCheckinDate = me.lastDate
+                        if let inv = me.config.interval, let invInt = Int(inv) {
                             self.alertInterval = invInt
                         }
                     }
-                } else if userRole == "student" {
-                    for s in decoded {
-                         if let inv = s.config.interval, let invInt = Int(inv) {
-                             self.alertInterval = invInt
-                             break
-                         }
-                    }
+                    self.scheduleLocalNotification()
+                } else {
+                    self.scheduleParentAlarm(decoded)
                 }
                 self.updateCountdown()
-                // 配置同步后，重新调度通知
-                if self.userRole == "student" {
-                    self.scheduleLocalNotification()
-                }
             }
         }.resume()
     }
@@ -305,39 +308,56 @@ struct ContentView: View {
         }.resume()
     }
 
-    // --- 核心修复：本地通知调度函数 ---
     func scheduleLocalNotification() {
         guard userRole == "student", let last = lastCheckinDate else { return }
-        
-        // 1. 移除旧的待发通知
         UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
         
-        // 2. 计算通知时间点 = 上次打卡时间 + 周期秒数 - 提前通知秒数
         let totalIntervalSeconds = Double(alertInterval) * 3600
         let advanceSeconds = Double(advanceNoticeMinutes) * 60
         let triggerTime = last.addingTimeInterval(totalIntervalSeconds - advanceSeconds)
-        
         let timeToWait = triggerTime.timeIntervalSince(Date())
         
-        // 如果计算出来的时间已经在过去，就不设置通知
         guard timeToWait > 0 else { return }
         
-        // 3. 创建通知内容
         let content = UNMutableNotificationContent()
         content.title = "Pingo 安全提醒"
         content.body = "距离预定的报平安时间还有 \(advanceNoticeMinutes) 分钟，请及时打卡。"
         content.sound = .default
         
-        // 4. 创建触发器
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: timeToWait, repeats: false)
-        
-        // 5. 提交
-        let request = UNNotificationRequest(identifier: "PingoReminder", content: content, trigger: trigger)
+        let request = UNNotificationRequest(identifier: "PingoStudentReminder", content: content, trigger: trigger)
         UNUserNotificationCenter.current().add(request)
     }
     
+    // 修复图 4 的编译错误：对 Double? 进行安全转换并提供默认值
+    func scheduleParentAlarm(_ studentList: [StudentStatus]) {
+        guard userRole == "parent" else { return }
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: studentList.map { "ParentAlarm-\($0.name)" })
+        
+        for student in studentList {
+            // 修复点：先将 String? 转换为 Double?，再通过 ?? 赋予 24.0 的默认值，确保后续可以乘以 3600
+            let intervalValue = Double(student.config.interval ?? "24") ?? 24.0
+            let invSeconds = intervalValue * 3600
+            
+            let overdueTime = student.lastDate.addingTimeInterval(invSeconds)
+            let alarmTriggerTime = overdueTime.addingTimeInterval(Double(parentAlertThreshold) * 60)
+            let timeToWait = alarmTriggerTime.timeIntervalSince(Date())
+            
+            if timeToWait > 0 {
+                let content = UNMutableNotificationContent()
+                content.title = "🚨 Pingo 超时告警"
+                content.body = "\(student.name) 已超过预定时间未报备，请关注！"
+                content.sound = UNNotificationSound.defaultCritical
+                
+                let trigger = UNTimeIntervalNotificationTrigger(timeInterval: timeToWait, repeats: false)
+                let request = UNNotificationRequest(identifier: "ParentAlarm-\(student.name)", content: content, trigger: trigger)
+                UNUserNotificationCenter.current().add(request)
+            }
+        }
+    }
+    
     func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge, .criticalAlert]) { _, _ in }
     }
 
     func triggerResetAPI() {
@@ -358,7 +378,6 @@ struct ContentView: View {
         let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"; return f.string(from: date)
     }
 
-    // --- 7. 视图组件 ---
     var welcomeView: some View {
         VStack(spacing: 40) {
             Image(systemName: "shield.lefthalf.filled").font(.system(size: 80)).foregroundColor(.green)
@@ -382,7 +401,7 @@ struct ContentView: View {
                 Color(UIColor.systemBackground).ignoresSafeArea()
                 VStack(spacing: 30) {
                     if !isCodeVerified {
-                        Text("重置管理密码").font(.title2.bold())
+                        Text("重置管理权限").font(.title2.bold())
                         Text("请输入邮箱收到的 6 位验证码").font(.subheadline).foregroundColor(.secondary)
                         TextField("000000", text: $resetCodeInput)
                             .keyboardType(.numberPad)
@@ -392,7 +411,7 @@ struct ContentView: View {
                             .background(Color(UIColor.secondarySystemBackground))
                             .cornerRadius(12)
                         Button(action: checkCodeMatch) {
-                            Text("验证码校验").frame(maxWidth: .infinity).padding().background(Color.blue).foregroundColor(.white).cornerRadius(12)
+                            Text("验证").frame(maxWidth: .infinity).padding().background(Color.blue).foregroundColor(.white).cornerRadius(12)
                         }
                     } else {
                         Text("验证成功").font(.title2.bold()).foregroundColor(.green)
@@ -441,6 +460,7 @@ struct SettingsView: View {
     @Binding var pwd: String
     @Binding var reminderTime: Date
     @Binding var advanceNotice: Int
+    @Binding var parentAlertThreshold: Int
     @Binding var userRole: String
     @AppStorage("hasCompletedSetup") var hasCompletedSetup = false
     @Environment(\.dismiss) var dismiss
@@ -458,13 +478,21 @@ struct SettingsView: View {
                     Section(header: Text("全家监控策略")) {
                         Stepper("报警周期: \(interval) 小时", value: $interval, in: 1...72)
                     }
+                    Section(header: Text("家长提醒定制")) {
+                        Stepper("学生超时后 \(parentAlertThreshold) 分钟提醒我", value: $parentAlertThreshold, in: 0...60, step: 5)
+                        Text("设置为 0 表示学生一超时立即通知家长。").font(.caption).foregroundColor(.secondary)
+                    }
                 } else {
                     Section(header: Text("身份设置")) {
                         TextField("学生姓名", text: $name)
                         TextField("家长邮箱", text: $email).autocapitalization(.none).keyboardType(.emailAddress)
                     }
-                    Section(header: Text("通知设置")) {
+                    Section(header: Text("提醒偏好")) {
+                        DatePicker("报平安参考时间", selection: $reminderTime, displayedComponents: .hourAndMinute)
                         Stepper("提前提醒: \(advanceNotice) 分钟", value: $advanceNotice, in: 5...120, step: 5)
+                    }
+                    Section(header: Text("通用策略")) {
+                        Stepper("报警周期: \(interval) 小时", value: $interval, in: 1...72)
                     }
                 }
 
